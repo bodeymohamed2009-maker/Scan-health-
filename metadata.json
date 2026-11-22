@@ -1,0 +1,10 @@
+{
+  "name": "Storybook Press",
+  "description": "Personalized children's coloring book generator that creates 5 thick-line black-and-white illustrations and a custom cover PDF.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
