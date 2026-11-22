@@ -30,7 +30,6 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir)) {
             fs.rmSync(docsDir, {recursive: true, force: true});
             fs.cpSync(distDir, docsDir, {recursive: true, force: true});
-            fs.writeFileSync(path.join(docsDir, '.nojekyll'), '');
           }
         },
       },
