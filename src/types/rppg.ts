@@ -1,14 +1,23 @@
 export type CaptureMode = "face" | "finger" | "calibration";
-export type RppgAlgorithm = "POS" | "CHROM" | "GREEN";
+export type RppgAlgorithm = "FUSION" | "POS" | "CHROM" | "GREEN";
 export type ScanDuration = 15 | 30 | 0; // 0 = continuous
 
 export type SignalQualityState =
   | "idle"
   | "calibrating"
   | "nominal"
+  | "paused"
   | "motion"
   | "low_light"
   | "no_skin";
+
+export type ZoneGuidance =
+  | "ok"
+  | "no_face"
+  | "off_center"
+  | "too_far"
+  | "too_close"
+  | "low_light";
 
 export interface RoiRgbTriplet {
   r: number;
@@ -63,6 +72,13 @@ export interface RoiBox {
   kind?: "skin" | "background";
 }
 
+export interface FaceBox {
+  cx: number;
+  cy: number;
+  rx: number;
+  ry: number;
+}
+
 export interface RoiExtractionResult {
   r: number;
   g: number;
@@ -75,6 +91,9 @@ export interface RoiExtractionResult {
   motionIndex: number;
   specularRejectedPct: number;
   faceCenter: { x: number; y: number };
+  faceBox: FaceBox;
+  inZone: boolean;
+  zoneGuidance: ZoneGuidance;
   roiBoxes: RoiBox[];
   hasValidTarget: boolean;
   awb?: AwbSampleState;
@@ -103,6 +122,11 @@ export interface RppgMetrics {
   snrDb: number;
   ambientCanceledDb: number;
   awb: AwbTelemetry;
+  algoWeights: {
+    pos: number;
+    chrom: number;
+    green: number;
+  };
   rmssdMs: number | null;
   sdnnMs: number | null;
   sd1Ms: number | null;
@@ -130,6 +154,12 @@ export interface RppgMetrics {
   spectrum: SpectrumBin[];
   dominantFreqHz: number | null;
   bufferSeconds: number;
+}
+
+export interface BiometricProfile {
+  age: number | null;
+  heightCm: number | null;
+  weightKg: number | null;
 }
 
 export interface SessionReading {

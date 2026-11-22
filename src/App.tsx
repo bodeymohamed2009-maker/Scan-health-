@@ -17,6 +17,7 @@ import {
   Waves,
   Wind,
 } from "lucide-react";
+import { HrvTrendsChart } from "./components/HrvTrendsChart";
 import { PoincarePlot } from "./components/PoincarePlot";
 import { RespirationChart } from "./components/RespirationChart";
 import { SessionLogTable } from "./components/SessionLogTable";
@@ -24,12 +25,14 @@ import { SessionReportModal } from "./components/SessionReportModal";
 import { SpectrumChart } from "./components/SpectrumChart";
 import { WaveformChart } from "./components/WaveformChart";
 import { RoiFrameExtractor } from "./dsp/roiExtractor";
+import { getAgeAdjustedNorms } from "./dsp/hrvTrends";
 import {
   KalmanBpmTracker,
   analyzeRppgBuffer,
   generateSyntheticSample,
 } from "./dsp/rppgEngine";
 import type {
+  BiometricProfile,
   CaptureMode,
   RgbSample,
   RoiBox,
@@ -38,6 +41,7 @@ import type {
   ScanDuration,
   SessionReading,
   SignalQualityState,
+  ZoneGuidance,
 } from "./types/rppg";
 
 const INITIAL_METRICS: RppgMetrics = {
@@ -54,6 +58,7 @@ const INITIAL_METRICS: RppgMetrics = {
     colorTempK: 5500,
     driftReducedPct: 0,
   },
+  algoWeights: { pos: 42, chrom: 36, green: 22 },
   rmssdMs: null,
   sdnnMs: null,
   sd1Ms: null,
@@ -79,6 +84,25 @@ const INITIAL_METRICS: RppgMetrics = {
   bufferSeconds: 0,
 };
 
+function getZoneGuidanceText(guidance: ZoneGuidance, mode: CaptureMode): string {
+  if (mode === "finger") {
+    return "أعد تغطية عدسة الكاميرا بإصبعك بلطف لاستئناف القياس";
+  }
+  switch (guidance) {
+    case "off_center":
+      return "وجهك قريب جداً من حافة الكاميرا — اقترب قليلاً نحو داخل الكادر للاستئناف";
+    case "too_far":
+      return "وجهك بعيد عن العدسة — قرّب وجهك قليلاً لاستئناف القياس";
+    case "too_close":
+      return "وجهك قريب جداً من العدسة — أبعد وجهك قليلاً لاستئناف القياس";
+    case "low_light":
+      return "الإضاءة منخفضة — وجّه إضاءة خفيفة نحو الوجه للاستئناف";
+    case "no_face":
+    default:
+      return "لم يتم رصد الوجه في الكادر — اظهر أمام الكاميرا ليلتقطه الإطار تلقائياً";
+  }
+}
+
 function getSignalStatusBadge(state: SignalQualityState): {
   label: string;
   toneClass: string;
@@ -88,6 +112,11 @@ function getSignalStatusBadge(state: SignalQualityState): {
       return {
         label: "● إشارة مستقرة (Kalman Lock)",
         toneClass: "text-emerald-400",
+      };
+    case "paused":
+      return {
+        label: "⏸ متوقف مؤقتاً — خارج النطاق",
+        toneClass: "text-amber-400",
       };
     case "calibrating":
       return {
@@ -127,9 +156,15 @@ export default function App() {
   const kalmanRef = useRef<KalmanBpmTracker>(new KalmanBpmTracker());
   const lastAnalyzeTimeRef = useRef<number>(0);
   const scanStartTimeRef = useRef<number>(0);
+  const activeElapsedMsRef = useRef<number>(0);
+  const lastTickTimeRef = useRef<number>(0);
+  const isPausedRef = useRef<boolean>(false);
+  const pauseStartedAtRef = useRef<number | null>(null);
+  const outOfZoneSinceRef = useRef<number | null>(null);
+  const inZoneSinceRef = useRef<number | null>(null);
 
   const [mode, setMode] = useState<CaptureMode>("face");
-  const [algorithm, setAlgorithm] = useState<RppgAlgorithm>("POS");
+  const [algorithm, setAlgorithm] = useState<RppgAlgorithm>("FUSION");
   const [scanDuration, setScanDuration] = useState<ScanDuration>(15);
   const [nlmsEnabled, setNlmsEnabled] = useState<boolean>(true);
   const [awbEnabled, setAwbEnabled] = useState<boolean>(true);
@@ -139,20 +174,68 @@ export default function App() {
   const [syntheticNoise, setSyntheticNoise] = useState<number>(0.4);
 
   const [isRunning, setIsRunning] = useState(false);
+  const [isPausedByZone, setIsPausedByZone] = useState(false);
+  const [zoneGuidance, setZoneGuidance] = useState<ZoneGuidance>("ok");
   const [elapsedSec, setElapsedSec] = useState(0);
   const [torchEnabled, setTorchEnabled] = useState(false);
   const [torchSupported, setTorchSupported] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
 
   const [roiBoxes, setRoiBoxes] = useState<RoiBox[]>([]);
-  const [faceCenter, setFaceCenter] = useState<{ x: number; y: number }>({
-    x: 0.5,
-    y: 0.44,
+  const [faceBox, setFaceBox] = useState<{
+    cx: number;
+    cy: number;
+    rx: number;
+    ry: number;
+  }>({
+    cx: 0.5,
+    cy: 0.46,
+    rx: 0.2,
+    ry: 0.32,
   });
   const [metrics, setMetrics] = useState<RppgMetrics>(INITIAL_METRICS);
-  const [readings, setReadings] = useState<SessionReading[]>([]);
+  const [profile, setProfile] = useState<BiometricProfile>(() => {
+    try {
+      const raw = localStorage.getItem("pulselab_biometric_profile_v1");
+      if (!raw) return { age: null, heightCm: null, weightKg: null };
+      const p = JSON.parse(raw);
+      return {
+        age: typeof p?.age === "number" ? p.age : null,
+        heightCm: typeof p?.heightCm === "number" ? p.heightCm : null,
+        weightKg: typeof p?.weightKg === "number" ? p.weightKg : null,
+      };
+    } catch {
+      return { age: null, heightCm: null, weightKg: null };
+    }
+  });
+  const [readings, setReadings] = useState<SessionReading[]>(() => {
+    try {
+      const raw = localStorage.getItem("pulselab_session_readings_v1");
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as SessionReading[]) : [];
+    } catch {
+      return [];
+    }
+  });
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("pulselab_biometric_profile_v1", JSON.stringify(profile));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [profile]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("pulselab_session_readings_v1", JSON.stringify(readings));
+    } catch {
+      // Ignore storage quota or private browsing errors
+    }
+  }, [readings]);
 
   const stopAcquisition = useCallback(() => {
     if (rafRef.current !== null) {
@@ -169,6 +252,11 @@ export default function App() {
       videoRef.current.srcObject = null;
     }
     setIsRunning(false);
+    setIsPausedByZone(false);
+    isPausedRef.current = false;
+    pauseStartedAtRef.current = null;
+    outOfZoneSinceRef.current = null;
+    inZoneSinceRef.current = null;
     setTorchEnabled(false);
     setTorchSupported(false);
   }, []);
@@ -236,9 +324,18 @@ export default function App() {
     extractorRef.current.reset();
     kalmanRef.current.reset();
     lastAnalyzeTimeRef.current = 0;
-    scanStartTimeRef.current = performance.now();
+    const nowTs = performance.now();
+    scanStartTimeRef.current = nowTs;
+    activeElapsedMsRef.current = 0;
+    lastTickTimeRef.current = nowTs;
+    isPausedRef.current = false;
+    pauseStartedAtRef.current = null;
+    outOfZoneSinceRef.current = null;
+    inZoneSinceRef.current = null;
+    setIsPausedByZone(false);
+    setZoneGuidance("ok");
     setElapsedSec(0);
-    setFaceCenter({ x: 0.5, y: 0.44 });
+    setFaceBox({ cx: 0.5, cy: 0.46, rx: 0.2, ry: 0.32 });
     setMetrics({ ...INITIAL_METRICS, signalState: "calibrating" });
 
     if (mode === "calibration") {
@@ -321,10 +418,18 @@ export default function App() {
     const tick = (now: number) => {
       if (cancelled) return;
 
-      const elapsed = (now - scanStartTimeRef.current) / 1000;
-      setElapsedSec(elapsed);
+      const dtMs =
+        lastTickTimeRef.current > 0
+          ? Math.min(120, Math.max(0, now - lastTickTimeRef.current))
+          : 0;
+      lastTickTimeRef.current = now;
+
+      let frameInZone = mode === "calibration";
 
       if (mode === "calibration") {
+        activeElapsedMsRef.current += dtMs;
+        setElapsedSec(activeElapsedMsRef.current / 1000);
+
         if (now - lastSyntheticPush >= 32) {
           lastSyntheticPush = now;
           const sample = generateSyntheticSample(
@@ -337,7 +442,8 @@ export default function App() {
           if (samplesRef.current.length > 960) {
             samplesRef.current.shift();
           }
-          setFaceCenter({ x: 0.5, y: 0.44 });
+          setFaceBox({ cx: 0.5, cy: 0.46, rx: 0.2, ry: 0.32 });
+          setZoneGuidance("ok");
           setRoiBoxes([
             { x: 0.37, y: 0.20, w: 0.26, h: 0.12, label: "Forehead ROI", kind: "skin" },
             { x: 0.32, y: 0.44, w: 0.12, h: 0.14, label: "Cheek L", kind: "skin" },
@@ -350,59 +456,101 @@ export default function App() {
         const video = videoRef.current;
         const canvas = analysisCanvasRef.current;
         if (video && canvas && video.readyState >= 2) {
+          if (mode === "face") {
+            extractorRef.current.pollNativeFaceDetector(video, now);
+          }
           const ctx = canvas.getContext("2d", { willReadFrequently: true });
           if (ctx) {
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
             const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
             const roi = extractorRef.current.extract(imgData, mode, awbEnabled);
             setRoiBoxes(roi.roiBoxes);
-            setFaceCenter(roi.faceCenter);
+            setFaceBox(roi.faceBox);
+            setZoneGuidance(roi.zoneGuidance);
+            frameInZone = roi.inZone;
 
-            if (roi.hasValidTarget) {
-              samplesRef.current.push({
-                t: now,
-                r: roi.r,
-                g: roi.g,
-                b: roi.b,
-                bgR: roi.bgR,
-                bgG: roi.bgG,
-                bgB: roi.bgB,
-                motion: roi.motionIndex,
-                skinPct: roi.skinCoveragePct,
-                luma: roi.brightness,
-                specularRejectedPct: roi.specularRejectedPct,
-                awb: roi.awb,
-                regions: roi.regions,
-              });
-              if (samplesRef.current.length > 960) {
-                samplesRef.current.shift();
+            // Auto-Pause / Seamless Resume Zone State Machine
+            if (roi.inZone) {
+              outOfZoneSinceRef.current = null;
+              if (isPausedRef.current) {
+                inZoneSinceRef.current ??= now;
+                if (now - inZoneSinceRef.current >= 220) {
+                  const pauseDuration =
+                    pauseStartedAtRef.current !== null
+                      ? now - pauseStartedAtRef.current
+                      : 0;
+                  if (pauseDuration > 18000) {
+                    // Long absence: start clean window without stale beats
+                    samplesRef.current = [];
+                    kalmanRef.current.reset();
+                  } else if (pauseDuration > 0) {
+                    // Temporary departure: shift timestamps forward for gap-free continuity
+                    for (const s of samplesRef.current) {
+                      s.t += pauseDuration;
+                    }
+                  }
+                  isPausedRef.current = false;
+                  pauseStartedAtRef.current = null;
+                  inZoneSinceRef.current = null;
+                  setIsPausedByZone(false);
+                }
               }
             } else {
-              setMetrics((prev) => ({
-                ...prev,
-                skinCoveragePct: Math.round(roi.skinCoveragePct),
-                brightness: Math.round(roi.brightness),
-                motionIndex: Number(roi.motionIndex.toFixed(1)),
-                specularRejectedPct: Number(roi.specularRejectedPct.toFixed(1)),
-                awb: roi.awb
-                  ? {
-                      enabled: awbEnabled,
-                      gainR: roi.awb.gainR,
-                      gainG: roi.awb.gainG,
-                      gainB: roi.awb.gainB,
-                      colorTempK: roi.awb.colorTempK,
-                      driftReducedPct: prev.awb.driftReducedPct,
-                    }
-                  : prev.awb,
-                signalState:
-                  roi.brightness < 38 && mode === "face" ? "low_light" : "no_skin",
-              }));
+              inZoneSinceRef.current = null;
+              if (!isPausedRef.current) {
+                outOfZoneSinceRef.current ??= now;
+                if (now - outOfZoneSinceRef.current >= 320) {
+                  isPausedRef.current = true;
+                  pauseStartedAtRef.current = now;
+                  setIsPausedByZone(true);
+                  setMetrics((prev) => ({
+                    ...prev,
+                    skinCoveragePct: Math.round(roi.skinCoveragePct),
+                    brightness: Math.round(roi.brightness),
+                    motionIndex: Number(roi.motionIndex.toFixed(1)),
+                    specularRejectedPct: Number(roi.specularRejectedPct.toFixed(1)),
+                    signalState: "paused",
+                  }));
+                }
+              }
+            }
+
+            if (!isPausedRef.current && roi.inZone) {
+              activeElapsedMsRef.current += dtMs;
+              setElapsedSec(activeElapsedMsRef.current / 1000);
+
+              if (roi.hasValidTarget) {
+                samplesRef.current.push({
+                  t: now,
+                  r: roi.r,
+                  g: roi.g,
+                  b: roi.b,
+                  bgR: roi.bgR,
+                  bgG: roi.bgG,
+                  bgB: roi.bgB,
+                  motion: roi.motionIndex,
+                  skinPct: roi.skinCoveragePct,
+                  luma: roi.brightness,
+                  specularRejectedPct: roi.specularRejectedPct,
+                  awb: roi.awb,
+                  regions: roi.regions,
+                });
+                if (samplesRef.current.length > 960) {
+                  samplesRef.current.shift();
+                }
+              }
             }
           }
         }
       }
 
-      if (now - lastAnalyzeTimeRef.current >= 200) {
+      const activeElapsed = activeElapsedMsRef.current / 1000;
+
+      if (
+        !isPausedRef.current &&
+        frameInZone &&
+        now - lastAnalyzeTimeRef.current >= 200
+      ) {
         lastAnalyzeTimeRef.current = now;
         const computed = analyzeRppgBuffer(
           samplesRef.current,
@@ -416,7 +564,7 @@ export default function App() {
         );
         setMetrics(computed);
 
-        if (scanDuration > 0 && elapsed >= scanDuration) {
+        if (scanDuration > 0 && activeElapsed >= scanDuration) {
           if (computed.bpm !== null) {
             recordSnapshot(computed, mode, algorithm, scanDuration);
           }
@@ -647,6 +795,131 @@ export default function App() {
               )}
             </div>
 
+            {/* Pre-Scan Biometric Profile (Age & Height Calibration) */}
+            {(() => {
+              const norms = getAgeAdjustedNorms(profile.age);
+              const bmi =
+                profile.heightCm && profile.weightKg && profile.heightCm > 0
+                  ? (
+                      profile.weightKg /
+                      Math.pow(profile.heightCm / 100, 2)
+                    ).toFixed(1)
+                  : null;
+              return (
+                <div className="bg-[#070b12] border border-slate-800 rounded-lg p-3.5 flex flex-col gap-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-200">
+                      بياناتك قبل القياس (السن والطول)
+                    </span>
+                    <span className="text-[10px] font-medium text-cyan-400">
+                      {profile.age && profile.heightCm
+                        ? "✓ مُعايَر عمرّياً"
+                        : "اختياري · يُحفظ تلقائياً"}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <label className="block">
+                      <span className="block text-[10px] text-slate-400 mb-1">
+                        السن (سنة)
+                      </span>
+                      <input
+                        type="number"
+                        min={8}
+                        max={110}
+                        placeholder="25"
+                        value={profile.age ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value === "" ? null : Number(e.target.value);
+                          setProfile((prev) => ({
+                            ...prev,
+                            age: v !== null && Number.isFinite(v) ? v : null,
+                          }));
+                        }}
+                        dir="ltr"
+                        className="w-full bg-[#0d131f] border border-slate-700 focus:border-cyan-400 rounded-md px-2.5 py-1.5 text-xs font-mono text-white outline-none tabular-nums"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="block text-[10px] text-slate-400 mb-1">
+                        الطول (سم)
+                      </span>
+                      <input
+                        type="number"
+                        min={90}
+                        max={230}
+                        placeholder="175"
+                        value={profile.heightCm ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value === "" ? null : Number(e.target.value);
+                          setProfile((prev) => ({
+                            ...prev,
+                            heightCm: v !== null && Number.isFinite(v) ? v : null,
+                          }));
+                        }}
+                        dir="ltr"
+                        className="w-full bg-[#0d131f] border border-slate-700 focus:border-cyan-400 rounded-md px-2.5 py-1.5 text-xs font-mono text-white outline-none tabular-nums"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="block text-[10px] text-slate-400 mb-1">
+                        الوزن (كجم)
+                      </span>
+                      <input
+                        type="number"
+                        min={25}
+                        max={250}
+                        placeholder="70"
+                        value={profile.weightKg ?? ""}
+                        onChange={(e) => {
+                          const v = e.target.value === "" ? null : Number(e.target.value);
+                          setProfile((prev) => ({
+                            ...prev,
+                            weightKg: v !== null && Number.isFinite(v) ? v : null,
+                          }));
+                        }}
+                        dir="ltr"
+                        className="w-full bg-[#0d131f] border border-slate-700 focus:border-cyan-400 rounded-md px-2.5 py-1.5 text-xs font-mono text-white outline-none tabular-nums"
+                      />
+                    </label>
+                  </div>
+
+                  {profile.age || bmi ? (
+                    <div
+                      dir="ltr"
+                      className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-800/80 text-[10px] font-mono text-slate-400 tabular-nums"
+                    >
+                      {norms.hrMaxBpm && (
+                        <span>
+                          HRmax: <strong className="text-cyan-300">{norms.hrMaxBpm}</strong> BPM
+                        </span>
+                      )}
+                      {profile.age && (
+                        <span>
+                          RMSSD Norm:{" "}
+                          <strong className="text-emerald-300">
+                            {norms.expectedRmssdRange[0]}–{norms.expectedRmssdRange[1]} ms
+                          </strong>
+                        </span>
+                      )}
+                      {bmi && (
+                        <span>
+                          BMI: <strong className="text-slate-200">{bmi}</strong>
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-[10px] text-slate-500 leading-snug">
+                      يُضبط العمر تلقائياً أقصى نبض (Tanaka) والمدى الطبيعي لـ HRV، بينما
+                      يوثّق الطول والوزن التقرير الفني.
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
+
             {/* Capture Mode */}
             <div>
               <span className="block text-xs font-semibold text-slate-300 mb-2">
@@ -698,7 +971,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Algorithm Selector */}
+            {/* Algorithm Selector (Tri-Algorithm Fusion Default) */}
             {mode !== "finger" && (
               <div>
                 <span className="block text-xs font-semibold text-slate-300 mb-2">
@@ -706,14 +979,14 @@ export default function App() {
                 </span>
                 <div
                   dir="ltr"
-                  className="grid grid-cols-3 gap-1.5 p-1 bg-[#070b12] border border-slate-800 rounded-lg"
+                  className="grid grid-cols-4 gap-1 p-1 bg-[#070b12] border border-slate-800 rounded-lg"
                 >
-                  {(["POS", "CHROM", "GREEN"] as RppgAlgorithm[]).map((algo) => (
+                  {(["FUSION", "POS", "CHROM", "GREEN"] as RppgAlgorithm[]).map((algo) => (
                     <button
                       key={algo}
                       type="button"
                       onClick={() => setAlgorithm(algo)}
-                      className={`py-2 text-xs font-mono font-semibold rounded-md transition-colors cursor-pointer ${
+                      className={`py-2 text-[11px] font-mono font-semibold rounded-md transition-colors cursor-pointer ${
                         algorithm === algo
                           ? "bg-slate-800 text-cyan-300"
                           : "text-slate-400 hover:text-slate-200"
@@ -723,6 +996,17 @@ export default function App() {
                     </button>
                   ))}
                 </div>
+                {algorithm === "FUSION" && (
+                  <div
+                    dir="ltr"
+                    className="mt-2 bg-[#070b12] border border-slate-800 rounded-lg px-3 py-2 flex items-center justify-between text-[11px] font-mono tabular-nums"
+                  >
+                    <span className="text-slate-400">Tri-Fusion</span>
+                    <span className="text-cyan-300">
+                      POS {metrics.algoWeights.pos}% · CHROM {metrics.algoWeights.chrom}% · GREEN {metrics.algoWeights.green}%
+                    </span>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1246,57 +1530,152 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Dynamic Centroid-Locked ROIs & Ambient Reference Zones */}
-                {mode !== "finger" && (
-                  <svg
-                    viewBox="0 0 100 100"
-                    preserveAspectRatio="none"
-                    className="pointer-events-none absolute inset-0 w-full h-full"
-                  >
-                    <ellipse
-                      cx={(1 - faceCenter.x) * 100}
-                      cy={faceCenter.y * 100}
-                      rx="21"
-                      ry="34"
-                      fill="none"
-                      stroke={
-                        metrics.signalState === "nominal"
-                          ? "#10b981"
-                          : "#06b6d4"
-                      }
-                      strokeWidth="0.55"
-                      strokeDasharray="2 1.5"
-                    />
-                    {isRunning &&
-                      roiBoxes.map((box) => {
-                        const mirroredX =
-                          mode === "face"
-                            ? (1 - box.x - box.w) * 100
-                            : box.x * 100;
-                        const isBg = box.kind === "background";
-                        return (
-                          <g key={box.label}>
-                            <rect
-                              x={mirroredX}
-                              y={box.y * 100}
-                              width={box.w * 100}
-                              height={box.h * 100}
-                              fill={
-                                isBg
-                                  ? "rgba(148, 163, 184, 0.08)"
-                                  : "rgba(6, 182, 212, 0.14)"
-                              }
-                              stroke={isBg ? "#64748b" : "#22d3ee"}
-                              strokeWidth="0.45"
-                              strokeDasharray={isBg ? "1.5 1" : undefined}
-                            />
-                          </g>
-                        );
-                      })}
-                  </svg>
+                {/* Auto-Tracking Moving Face Zone & Dynamic ROI HUD */}
+                {mode !== "finger" &&
+                  (() => {
+                    const useLiveZone =
+                      isRunning && mode === "face" && !isPausedByZone;
+                    const zCx = useLiveZone ? (1 - faceBox.cx) * 100 : 50;
+                    const zCy = useLiveZone ? faceBox.cy * 100 : 46;
+                    const zRx = useLiveZone
+                      ? Math.max(13, Math.min(36, faceBox.rx * 112))
+                      : 21;
+                    const zRy = useLiveZone
+                      ? Math.max(19, Math.min(44, faceBox.ry * 112))
+                      : 32;
+                    const bx0 = Math.max(2, zCx - zRx - 2.5);
+                    const bx1 = Math.min(98, zCx + zRx + 2.5);
+                    const by0 = Math.max(2, zCy - zRy - 2);
+                    const by1 = Math.min(98, zCy + zRy + 2);
+                    const arm = 5.5;
+                    const zoneStroke = !isRunning
+                      ? "#475569"
+                      : isPausedByZone
+                      ? "#f59e0b"
+                      : metrics.signalState === "nominal"
+                      ? "#10b981"
+                      : "#06b6d4";
+
+                    return (
+                      <svg
+                        viewBox="0 0 100 100"
+                        preserveAspectRatio="none"
+                        className="pointer-events-none absolute inset-0 w-full h-full"
+                      >
+                        {/* Dynamic Moving Corner Targeting Brackets Locked Around Face */}
+                        <path
+                          d={`M ${bx0} ${by0 + arm} L ${bx0} ${by0} L ${bx0 + arm} ${by0} M ${bx1 - arm} ${by0} L ${bx1} ${by0} L ${bx1} ${by0 + arm} M ${bx0} ${by1 - arm} L ${bx0} ${by1} L ${bx0 + arm} ${by1} M ${bx1 - arm} ${by1} L ${bx1} ${by1} L ${bx1} ${by1 - arm}`}
+                          fill="none"
+                          stroke={zoneStroke}
+                          strokeWidth="0.75"
+                        />
+
+                        {/* Auto-Moving Face Alignment Zone */}
+                        <ellipse
+                          cx={zCx}
+                          cy={zCy}
+                          rx={zRx}
+                          ry={zRy}
+                          fill={
+                            isRunning && isPausedByZone
+                              ? "rgba(245, 158, 11, 0.06)"
+                              : isRunning && metrics.signalState === "nominal"
+                              ? "rgba(16, 185, 129, 0.05)"
+                              : isRunning
+                              ? "rgba(6, 182, 212, 0.04)"
+                              : "none"
+                          }
+                          stroke={zoneStroke}
+                          strokeWidth={isRunning && !isPausedByZone ? "0.7" : "0.55"}
+                          strokeDasharray={
+                            isRunning &&
+                            metrics.signalState === "nominal" &&
+                            !isPausedByZone
+                              ? undefined
+                              : "2 1.5"
+                          }
+                        />
+
+                        {/* Inner Face Contour Ring */}
+                        {useLiveZone && (
+                          <ellipse
+                            cx={(1 - faceBox.cx) * 100}
+                            cy={faceBox.cy * 100}
+                            rx={faceBox.rx * 100}
+                            ry={faceBox.ry * 100}
+                            fill="none"
+                            stroke="rgba(34, 211, 238, 0.45)"
+                            strokeWidth="0.35"
+                            strokeDasharray="1 1"
+                          />
+                        )}
+
+                        {/* Dynamic Forehead, Cheeks & Ambient Ref ROIs */}
+                        {isRunning &&
+                          !isPausedByZone &&
+                          roiBoxes.map((box) => {
+                            const mirroredX =
+                              mode === "face"
+                                ? (1 - box.x - box.w) * 100
+                                : box.x * 100;
+                            const isBg = box.kind === "background";
+                            return (
+                              <g key={box.label}>
+                                <rect
+                                  x={mirroredX}
+                                  y={box.y * 100}
+                                  width={box.w * 100}
+                                  height={box.h * 100}
+                                  fill={
+                                    isBg
+                                      ? "rgba(148, 163, 184, 0.08)"
+                                      : "rgba(6, 182, 212, 0.14)"
+                                  }
+                                  stroke={isBg ? "#64748b" : "#22d3ee"}
+                                  strokeWidth="0.45"
+                                  strokeDasharray={isBg ? "1.5 1" : undefined}
+                                />
+                              </g>
+                            );
+                          })}
+                      </svg>
+                    );
+                  })()}
+
+                {/* Zone Status Chip (Top-Right inside HUD) */}
+                {isRunning && mode !== "calibration" && (
+                  <div className="pointer-events-none absolute top-3 right-3 flex items-center gap-2">
+                    <span
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-semibold border backdrop-blur-sm ${
+                        isPausedByZone
+                          ? "bg-amber-950/85 border-amber-500/50 text-amber-300"
+                          : "bg-slate-950/80 border-emerald-500/40 text-emerald-300"
+                      }`}
+                    >
+                      {isPausedByZone
+                        ? "⏸ متوقف مؤقتاً · بانتظار ظهور الوجه"
+                        : mode === "face"
+                        ? `● تتبع الوجه مقفل تلقائياً · تغطية ${metrics.skinCoveragePct}%`
+                        : "● الإصبع مثبت على العدسة"}
+                    </span>
+                  </div>
                 )}
 
-                {mode === "finger" && isRunning && (
+                {/* Translucent Pause Banner when user temporarily leaves the frame */}
+                {isRunning && isPausedByZone && mode !== "calibration" && (
+                  <div className="pointer-events-none absolute inset-x-4 bottom-3 flex justify-center">
+                    <div className="bg-slate-950/90 border border-amber-500/50 rounded-lg px-4 py-2.5 text-center shadow-lg max-w-md">
+                      <p className="text-xs font-bold text-amber-300">
+                        تم إيقاف المؤقت والبيانات مؤقتاً لحين عودتك
+                      </p>
+                      <p className="text-[11px] text-slate-200 mt-0.5">
+                        {getZoneGuidanceText(zoneGuidance, mode)}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {mode === "finger" && isRunning && !isPausedByZone && (
                   <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
                     <div className="w-32 h-32 rounded-2xl border-2 border-dashed border-cyan-400 flex items-end justify-center p-2">
                       <span className="text-[11px] font-medium text-white bg-slate-900/80 px-2 py-0.5 rounded">
@@ -1311,12 +1690,12 @@ export default function App() {
                     <Camera className="w-8 h-8 text-cyan-400" />
                     <p className="text-sm font-semibold text-white">
                       {mode === "face"
-                        ? "ضع وجهك داخل الإطار البيضاوي في إضاءة متساوية"
+                        ? "يتحرك الإطار تلقائياً لتتبع وجهك أينما كنت في الكادر"
                         : "ضع طرف إصبعك برفق على الكاميرا الخلفية"}
                     </p>
                     <p className="text-xs text-slate-400 max-w-md leading-relaxed">
-                      يتم تتبع مناطق الجلد ديناميكياً وطرح وميض الإضاءة الخلفي
-                      عبر NLMS محلياً على جهازك دون إرسال أي بيانات.
+                      يتم قفل منطقة القياس على وجهك ديناميكياً وطرح وميض الإضاءة
+                      الخلفي عبر NLMS محلياً على جهازك دون إرسال أي بيانات.
                     </p>
                   </div>
                 )}
@@ -1369,6 +1748,9 @@ export default function App() {
                 bufferSeconds={metrics.bufferSeconds}
               />
             </div>
+
+            {/* Longitudinal HRV Trends & Autonomic Balance Drift Monitor */}
+            <HrvTrendsChart readings={readings} profile={profile} />
           </div>
         </section>
 
@@ -1648,6 +2030,8 @@ export default function App() {
         isOpen={reportOpen}
         onClose={() => setReportOpen(false)}
         metrics={metrics}
+        readings={readings}
+        profile={profile}
         mode={mode}
         algorithm={algorithm}
         nlmsEnabled={nlmsEnabled}

@@ -34,15 +34,17 @@ function stdDev(arr: Float64Array | number[], mu?: number): number {
 }
 
 /**
- * 1D Kalman Heart-Rate Tracker with SNR-adaptive measurement noise
- * and motion-artifact freeze gating.
+ * 2-State Velocity-Aware 1D Kalman Heart-Rate Tracker [bpm, velocity]
+ * with SNR-adaptive measurement noise and motion-artifact freeze gating.
  */
 export class KalmanBpmTracker {
   private x: number | null = null; // estimated BPM
+  private v = 0; // BPM rate of change per update
   private p = 100; // error covariance
 
   public reset(): void {
     this.x = null;
+    this.v = 0;
     this.p = 100;
   }
 
@@ -57,7 +59,8 @@ export class KalmanBpmTracker {
 
     if (this.x === null) {
       this.x = measuredBpm;
-      this.p = 12;
+      this.v = 0;
+      this.p = 10;
       return Math.round(this.x);
     }
 
@@ -66,21 +69,24 @@ export class KalmanBpmTracker {
       return Math.round(this.x);
     }
 
-    // Process noise Q allows natural physiological HRV drift
-    const Q = 0.65;
+    // Predict step with damped velocity prior
+    const predicted = this.x + this.v * 0.45;
+    const Q = 0.55;
     this.p += Q;
 
-    // Measurement noise R inversely proportional to SNR quality
-    const clampedSnr = Math.max(0.5, Math.min(20, snrDb));
-    const R = 28 / clampedSnr;
+    // Measurement noise R scales inversely with SNR quality
+    const clampedSnr = Math.max(0.5, Math.min(22, snrDb));
+    const R = 22 / Math.pow(clampedSnr, 1.15);
 
-    // Reject single-frame wild outlier jumps (>28 BPM) unless SNR is exceptionally strong
-    if (Math.abs(measuredBpm - this.x) > 28 && snrDb < 8.0) {
+    // Reject single-frame outlier jumps (>24 BPM) unless SNR is exceptionally strong
+    if (Math.abs(measuredBpm - predicted) > 24 && snrDb < 8.5) {
       return Math.round(this.x);
     }
 
     const K = this.p / (this.p + R);
-    this.x = this.x + K * (measuredBpm - this.x);
+    const innovation = measuredBpm - predicted;
+    this.x = predicted + K * innovation;
+    this.v = Math.max(-2.5, Math.min(2.5, this.v * 0.6 + K * innovation * 0.35));
     this.p = (1 - K) * this.p;
 
     return Math.round(this.x);
@@ -682,9 +688,150 @@ function selectBvpSignal(
   fs: number
 ): Float64Array {
   if (mode === "finger") return extractGreenSignal(r, g, "finger");
-  if (algorithm === "POS") return extractPosSignal(r, g, b, fs);
   if (algorithm === "CHROM") return extractChromSignal(r, g, b, fs);
-  return extractGreenSignal(r, g, mode);
+  if (algorithm === "GREEN") return extractGreenSignal(r, g, mode);
+  return extractPosSignal(r, g, b, fs);
+}
+
+interface AlgoFusionResult {
+  filtered: Float64Array;
+  weights: { pos: number; chrom: number; green: number };
+}
+
+function normalizeUnitStd(arr: Float64Array): Float64Array {
+  const m = mean(arr);
+  const s = stdDev(arr, m) || 1;
+  const out = new Float64Array(arr.length);
+  for (let i = 0; i < arr.length; i++) {
+    out[i] = (arr[i] - m) / s;
+  }
+  return out;
+}
+
+function alignPolarityToRef(sig: Float64Array, ref: Float64Array): Float64Array {
+  let dot = 0;
+  const len = Math.min(sig.length, ref.length);
+  for (let i = 0; i < len; i++) {
+    dot += sig[i] * ref[i];
+  }
+  if (dot >= 0) return sig;
+  const flipped = new Float64Array(sig.length);
+  for (let i = 0; i < sig.length; i++) flipped[i] = -sig[i];
+  return flipped;
+}
+
+function detrendSlidingMean(signal: Float64Array, halfWin: number): Float64Array {
+  const N = signal.length;
+  if (N < 8) return new Float64Array(signal);
+  const prefix = new Float64Array(N + 1);
+  for (let i = 0; i < N; i++) {
+    prefix[i + 1] = prefix[i] + signal[i];
+  }
+  const out = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    const lo = Math.max(0, i - halfWin);
+    const hi = Math.min(N - 1, i + halfWin);
+    const localMean = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1);
+    out[i] = signal[i] - localMean;
+  }
+  return out;
+}
+
+/**
+ * Tri-Algorithm Phase-Aligned Fusion (POS + CHROM + GREEN) with SNR SoftMax,
+ * spectral concentration weighting, and fundamental frequency consensus boosting.
+ */
+function extractBandpassedByAlgorithm(
+  r: Float64Array,
+  g: Float64Array,
+  b: Float64Array,
+  algorithm: RppgAlgorithm,
+  mode: CaptureMode,
+  fs: number
+): AlgoFusionResult {
+  const halfDetrend = Math.max(8, Math.round(fs * 0.75));
+
+  if (mode === "finger" || algorithm !== "FUSION") {
+    const raw = detrendSlidingMean(
+      selectBvpSignal(r, g, b, algorithm, mode, fs),
+      halfDetrend
+    );
+    const filtered = zeroPhaseBandpass(raw, fs, 0.7, 3.5);
+    const w =
+      mode === "finger" || algorithm === "GREEN"
+        ? { pos: 0, chrom: 0, green: 100 }
+        : algorithm === "CHROM"
+        ? { pos: 0, chrom: 100, green: 0 }
+        : { pos: 100, chrom: 0, green: 0 };
+    return { filtered, weights: w };
+  }
+
+  const fPos = normalizeUnitStd(
+    zeroPhaseBandpass(
+      detrendSlidingMean(extractPosSignal(r, g, b, fs), halfDetrend),
+      fs,
+      0.7,
+      3.5
+    )
+  );
+  const fChromRaw = normalizeUnitStd(
+    zeroPhaseBandpass(
+      detrendSlidingMean(extractChromSignal(r, g, b, fs), halfDetrend),
+      fs,
+      0.7,
+      3.5
+    )
+  );
+  const fGreenRaw = normalizeUnitStd(
+    zeroPhaseBandpass(
+      detrendSlidingMean(extractGreenSignal(r, g, mode), halfDetrend),
+      fs,
+      0.7,
+      3.5
+    )
+  );
+
+  const fChrom = alignPolarityToRef(fChromRaw, fPos);
+  const fGreen = alignPolarityToRef(fGreenRaw, fPos);
+
+  const sPos = evaluateCardiacSpectrum(fPos, fs);
+  const sChrom = evaluateCardiacSpectrum(fChrom, fs);
+  const sGreen = evaluateCardiacSpectrum(fGreen, fs);
+
+  // Inter-algorithm frequency consensus boost (±0.06 Hz ≈ ±3.6 BPM)
+  const near = (f1: number, f2: number) => Math.abs(f1 - f2) <= 0.06;
+  const consensusPos =
+    (near(sPos.dominantFreqHz, sChrom.dominantFreqHz) ? 1.3 : 1.0) *
+    (near(sPos.dominantFreqHz, sGreen.dominantFreqHz) ? 1.18 : 1.0);
+  const consensusChrom =
+    (near(sChrom.dominantFreqHz, sPos.dominantFreqHz) ? 1.3 : 1.0) *
+    (near(sChrom.dominantFreqHz, sGreen.dominantFreqHz) ? 1.18 : 1.0);
+  const consensusGreen =
+    (near(sGreen.dominantFreqHz, sPos.dominantFreqHz) ? 1.18 : 1.0) *
+    (near(sGreen.dominantFreqHz, sChrom.dominantFreqHz) ? 1.18 : 1.0);
+
+  const rawWPos = 1.25 * consensusPos * Math.exp(Math.max(-4, Math.min(18, sPos.snrDb)) / 3.0);
+  const rawWChrom = 1.15 * consensusChrom * Math.exp(Math.max(-4, Math.min(18, sChrom.snrDb)) / 3.0);
+  const rawWGreen = 0.78 * consensusGreen * Math.exp(Math.max(-4, Math.min(18, sGreen.snrDb)) / 3.0);
+
+  const wSum = rawWPos + rawWChrom + rawWGreen || 1;
+  const wp = rawWPos / wSum;
+  const wc = rawWChrom / wSum;
+  const wg = rawWGreen / wSum;
+
+  const fused = new Float64Array(fPos.length);
+  for (let i = 0; i < fPos.length; i++) {
+    fused[i] = wp * fPos[i] + wc * fChrom[i] + wg * fGreen[i];
+  }
+
+  return {
+    filtered: fused,
+    weights: {
+      pos: Math.round(wp * 100),
+      chrom: Math.round(wc * 100),
+      green: Math.max(0, 100 - Math.round(wp * 100) - Math.round(wc * 100)),
+    },
+  };
 }
 
 interface BiquadCoeffs {
@@ -835,9 +982,9 @@ function fftReal(signal: Float64Array, fftSize: number): Float64Array {
 }
 
 function evaluateCardiacSpectrum(filtered: Float64Array, fs: number) {
-  const fftInputLen = Math.min(300, filtered.length);
+  const fftInputLen = Math.min(360, filtered.length);
   const fftSlice = filtered.slice(filtered.length - fftInputLen);
-  const fftSize = 1024;
+  const fftSize = 2048;
   const power = fftReal(fftSlice, fftSize);
   const binResHz = fs / fftSize;
 
@@ -845,14 +992,20 @@ function evaluateCardiacSpectrum(filtered: Float64Array, fs: number) {
   const maxBin = Math.min(power.length - 2, Math.ceil(3.2 / binResHz));
 
   let peakBin = minBin;
+  let maxCombScore = 0;
   let maxPower = 0;
   let totalBandPower = 0;
 
   for (let i = minBin; i <= maxBin; i++) {
     totalBandPower += power[i];
-    if (power[i] > maxPower) {
-      maxPower = power[i];
+    const h2 = i * 2;
+    const harmonicBoost =
+      h2 < power.length - 1 ? 0.30 * Math.max(power[h2 - 1], power[h2], power[h2 + 1]) : 0;
+    const combScore = power[i] + harmonicBoost;
+    if (combScore > maxCombScore) {
+      maxCombScore = combScore;
       peakBin = i;
+      maxPower = power[i];
     }
   }
 
@@ -1422,6 +1575,14 @@ export function analyzeRppgBuffer(
       snrDb: 0,
       ambientCanceledDb: 0,
       awb: uniform.awb,
+      algoWeights:
+        algorithm === "FUSION"
+          ? { pos: 42, chrom: 36, green: 22 }
+          : algorithm === "CHROM"
+          ? { pos: 0, chrom: 100, green: 0 }
+          : algorithm === "GREEN" || mode === "finger"
+          ? { pos: 0, chrom: 0, green: 100 }
+          : { pos: 100, chrom: 0, green: 0 },
       rmssdMs: null,
       sdnnMs: null,
       sd1Ms: null,
@@ -1457,6 +1618,7 @@ export function analyzeRppgBuffer(
 
   let filtered: Float64Array;
   let roiWeights = { forehead: 34, leftCheek: 33, rightCheek: 33 };
+  let algoWeights = { pos: 100, chrom: 0, green: 0 };
 
   if (
     mode !== "finger" &&
@@ -1474,6 +1636,7 @@ export function analyzeRppgBuffer(
       key: "forehead" | "leftCheek" | "rightCheek";
       sig: Float64Array;
       rawWeight: number;
+      algoW: { pos: number; chrom: number; green: number };
     }> = [];
 
     for (const reg of regions) {
@@ -1482,10 +1645,11 @@ export function analyzeRppgBuffer(
           key: reg.key,
           sig: new Float64Array(r.length),
           rawWeight: 0,
+          algoW: { pos: 0, chrom: 0, green: 0 },
         });
         continue;
       }
-      const rawR = selectBvpSignal(
+      const resReg = extractBandpassedByAlgorithm(
         reg.ch.r.subarray(cardStart),
         reg.ch.g.subarray(cardStart),
         reg.ch.b.subarray(cardStart),
@@ -1493,7 +1657,7 @@ export function analyzeRppgBuffer(
         mode,
         TARGET_FS
       );
-      const filtR = zeroPhaseBandpass(rawR, TARGET_FS, 0.7, 3.5);
+      const filtR = resReg.filtered;
       const specR = evaluateCardiacSpectrum(filtR, TARGET_FS);
       const sd = stdDev(filtR) || 1;
       const normSig = new Float64Array(filtR.length);
@@ -1501,26 +1665,49 @@ export function analyzeRppgBuffer(
 
       const prior = reg.key === "forehead" ? 1.15 : 1.0;
       const w = prior * Math.exp(Math.max(-5, Math.min(18, specR.snrDb)) / 3.5);
-      regionSignals.push({ key: reg.key, sig: normSig, rawWeight: w });
+      regionSignals.push({
+        key: reg.key,
+        sig: normSig,
+        rawWeight: w,
+        algoW: resReg.weights,
+      });
     }
 
     const totalW = regionSignals.reduce((acc, item) => acc + item.rawWeight, 0);
     if (totalW > 0) {
       filtered = new Float64Array(r.length);
+      const refSig =
+        regionSignals.find((x) => x.rawWeight > 0)?.sig ?? regionSignals[0].sig;
+      let accPos = 0;
+      let accChrom = 0;
+      let accGreen = 0;
       for (const item of regionSignals) {
         const wNorm = item.rawWeight / totalW;
         roiWeights[item.key] = Math.round(wNorm * 100);
+        accPos += wNorm * item.algoW.pos;
+        accChrom += wNorm * item.algoW.chrom;
+        accGreen += wNorm * item.algoW.green;
+        const alignedSig = alignPolarityToRef(item.sig, refSig);
         for (let i = 0; i < filtered.length; i++) {
-          filtered[i] += wNorm * item.sig[i];
+          filtered[i] += wNorm * alignedSig[i];
         }
       }
+      const pInt = Math.round(accPos);
+      const cInt = Math.round(accChrom);
+      algoWeights = {
+        pos: pInt,
+        chrom: cInt,
+        green: Math.max(0, 100 - pInt - cInt),
+      };
     } else {
-      const rawSignal = selectBvpSignal(r, g, b, algorithm, mode, TARGET_FS);
-      filtered = zeroPhaseBandpass(rawSignal, TARGET_FS, 0.7, 3.5);
+      const fb = extractBandpassedByAlgorithm(r, g, b, algorithm, mode, TARGET_FS);
+      filtered = fb.filtered;
+      algoWeights = fb.weights;
     }
   } else {
-    const rawSignal = selectBvpSignal(r, g, b, algorithm, mode, TARGET_FS);
-    filtered = zeroPhaseBandpass(rawSignal, TARGET_FS, 0.7, 3.5);
+    const fb = extractBandpassedByAlgorithm(r, g, b, algorithm, mode, TARGET_FS);
+    filtered = fb.filtered;
+    algoWeights = fb.weights;
     if (mode === "finger") {
       roiWeights = { forehead: 100, leftCheek: 0, rightCheek: 0 };
     }
@@ -1628,6 +1815,7 @@ export function analyzeRppgBuffer(
     snrDb,
     ambientCanceledDb: uniform.ambientCanceledDb,
     awb: uniform.awb,
+    algoWeights,
     rmssdMs: validRawBpm ? hrvStats.rmssdMs : null,
     sdnnMs: validRawBpm ? hrvStats.sdnnMs : null,
     sd1Ms: validRawBpm ? hrvStats.sd1Ms : null,
